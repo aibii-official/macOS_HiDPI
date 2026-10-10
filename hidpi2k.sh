@@ -31,6 +31,8 @@ WS_KEY="DisplayResolutionEnabled"
 MARKER_KEY="HIDPI2KInjected"
 
 # HiDPI 逻辑分辨率档位（实际渲染 = 2 倍后缩小，覆盖 1080p/2K/4K 屏常用档）
+# install 时还会按每块屏的原生分辨率自动追加一档「原生 HiDPI」
+# （逻辑 = 物理，渲染 2 倍：UI 大小不变、全屏 4x 超采样，最细腻）
 HIDPI_MODES=(1280x720 1440x810 1600x900 1920x1080 2048x1152 2240x1260)
 # 附带注入的普通（非 HiDPI）档位；后半部分是各 HiDPI 档的渲染分辨率，
 # 作为"垫底模式"帮助系统校验通过
@@ -120,10 +122,20 @@ entry_hidpi_b()  { hex_to_b64 "$(printf '%08x%08x0000000900a00000' $(($1*2)) $((
 
 xml_escape() { printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'; }
 
-# 生成 override plist 到 stdout 指定路径
-generate_plist() { # vid(hex) pid(hex) name outpath
-    local vid="$1" pid="$2" name="$3" out="$4"
+# 生成 override plist 到指定路径；按该屏原生分辨率追加「原生 HiDPI」档
+generate_plist() { # vid(hex) pid(hex) name outpath native_w native_h
+    local vid="$1" pid="$2" name="$3" out="$4" nat_w="${5:-0}" nat_h="${6:-0}"
     local vid_dec=$((16#$vid)) pid_dec=$((16#$pid))
+    # 档位列表 = 固定档位 + 原生 HiDPI 档（去重；渲染宽度封顶 7680）
+    local hidpi_list=("${HIDPI_MODES[@]}") normal_list=("${NORMAL_MODES[@]}")
+    local m nat="" render=""
+    if [ "$nat_w" -gt 0 ] 2>/dev/null && [ $((nat_w*2)) -le 7680 ]; then
+        nat="${nat_w}x${nat_h}"; render="$((nat_w*2))x$((nat_h*2))"
+        for m in "${hidpi_list[@]}"; do [ "$m" = "$nat" ] && nat=""; done
+        if [ -n "$nat" ]; then hidpi_list+=("$nat"); fi
+        for m in "${normal_list[@]}"; do [ "$m" = "$render" ] && render=""; done
+        if [ -n "$render" ]; then normal_list+=("$render"); fi
+    fi
     local tmp; tmp="$(mktemp -t hidpi2k)"
     {
         echo '<?xml version="1.0" encoding="UTF-8"?>'
@@ -141,11 +153,11 @@ generate_plist() { # vid(hex) pid(hex) name outpath
         echo "    <key>scale-resolutions</key>"
         echo "    <array>"
         local m w h
-        for m in "${HIDPI_MODES[@]}"; do w="${m%x*}"; h="${m#*x}"
+        for m in "${hidpi_list[@]}"; do w="${m%x*}"; h="${m#*x}"
             echo "        <data>$(entry_hidpi_a "$w" "$h")</data>"; done
-        for m in "${HIDPI_MODES[@]}"; do w="${m%x*}"; h="${m#*x}"
+        for m in "${hidpi_list[@]}"; do w="${m%x*}"; h="${m#*x}"
             echo "        <data>$(entry_hidpi_b "$w" "$h")</data>"; done
-        for m in "${NORMAL_MODES[@]}"; do w="${m%x*}"; h="${m#*x}"
+        for m in "${normal_list[@]}"; do w="${m%x*}"; h="${m#*x}"
             echo "        <data>$(entry_normal "$w" "$h")</data>"; done
         echo "    </array>"
         echo '</dict>'
@@ -252,7 +264,7 @@ cmd_install() {
         [ -z "${vid}${pid}${name}" ] && continue
         local cls reason; IFS='|' read -r cls reason <<< "$(classify "$vid" "$pid" "$name" "$w" "$h" "$builtin")"
         if [ "$cls" = "eligible" ]; then
-            eligible+=("$vid"$'\t'"$pid"$'\t'"$name")
+            eligible+=("$vid"$'\t'"$pid"$'\t'"$name"$'\t'"$w"$'\t'"$h")
         else
             skipped=$((skipped+1)); echo "  跳过：${name}（${reason}）"
         fi
@@ -268,13 +280,14 @@ cmd_install() {
     [ "${#targets[@]}" -eq 0 ] && { echo "未选择任何显示器，已取消。"; exit 0; }
 
     for t in "${targets[@]}"; do
-        local vid pid name
+        local vid pid name nw nh
         vid="$(echo "$t" | cut -f1)"; pid="$(echo "$t" | cut -f2)"; name="$(echo "$t" | cut -f3)"
+        nw="$(echo "$t" | cut -f4)"; nh="$(echo "$t" | cut -f5)"
         local dir="$OVERRIDE_ROOT/DisplayVendorID-$vid"
         local file="$dir/DisplayProductID-$pid"
         echo "正在为「${name}」(VID:${vid} PID:${pid}) 生成 HiDPI 配置……"
         local tmp; tmp="$(mktemp -t hidpi2k-plist)"
-        generate_plist "$vid" "$pid" "$name" "$tmp"
+        generate_plist "$vid" "$pid" "$name" "$tmp" "$nw" "$nh"
         mkdir -p "$dir"
         [ -f "$file" ] && cp "$file" "$file.bak.$(date +%Y%m%d%H%M%S)"
         cp "$tmp" "$file"; rm -f "$tmp"
@@ -286,8 +299,10 @@ cmd_install() {
     echo "已开启 WindowServer ${WS_KEY}。"
     echo ""
     echo "完成！请注销或重启后，到「系统设置 → 显示器」按住 Option 点「缩放」"
-    echo "（或勾选「显示所有分辨率」），即可看到并选择带（HiDPI）标志的档位，"
-    echo "2K 屏推荐选择 2048x1152（HiDPI）。"
+    echo "（或勾选「显示所有分辨率」），即可看到带 HiDPI 效果的档位。"
+    echo "常用推荐：2K 屏选 2048x1152；1080p 屏选 1280x720。"
+    echo "也可选与原生分辨率同名的档位（如 2560x1440 / 1920x1080 的 HiDPI 档）："
+    echo "UI 大小不变、全屏 4x 超采样，细腻度拉满。"
 }
 
 cmd_uninstall() {
